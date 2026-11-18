@@ -1,0 +1,8 @@
+# Go coverage and profiling output
+*.out
+coverage.*
+
+# Editor and operating system artifacts
+.DS_Store
+*.swp
+.idea/

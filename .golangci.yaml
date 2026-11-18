@@ -1,0 +1,94 @@
+# Setup the configuration schema version for v2
+version: "2"
+
+run:
+  # Timeout for analysis. Default is 1m.
+  timeout: 5m
+  # Set the base directory for relative paths (cfg, wd, gomod, gitroot)
+  relative-path-mode: cfg
+
+linters:
+  # We start by disabling all default linters to enable them selectively
+  default: none
+  
+  enable:
+    # --- Core & Bug-Detection ---
+    - errcheck     # Checks for unchecked errors
+    - govet        # Reports suspicious constructs (printf-errors, shadow variables)
+    - ineffassign  # Detects unused assignments to variables
+    - staticcheck  # Applies a massive set of static analysis checks
+    - unused       # Finds unused constants, variables, functions, and types
+
+    # --- Code Style & Quality ---
+    - revive       # Highly configurable linter for style guidelines (successor to golint)
+    - gocritic     # Provides diagnostics, style, and performance advice
+    - misspell     # Finds commonly misspelled English words in comments and strings
+    - goheader     # Checks the copyright/license header of every file
+
+    # --- Security & Performance ---
+    - gosec        # Inspects source code for security problems
+    - prealloc     # Finds slice declarations that could potentially be preallocated
+
+  # Linter
+  settings:
+    govet:
+      # Enable shadow check (detects shadowed variables)
+      enable:
+        - shadow
+
+    gosec:
+      excludes:
+        - G306
+        # G304 (file inclusion via variable): reading files by caller-supplied
+        # path is the purpose of this library (OsResolver, LoadFile,
+        # manifests); the check would fire on every such read.
+        - G304
+
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+          disabled: false
+        - name: blank-imports
+          disabled: false
+
+    gocritic:
+      # Enable useful diagnostic, style, and performance checks
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint # Disables the requirement to explain '//nolint' comments
+        # hugeParam: Value (120 bytes) is a value type passed by value by
+        # design; converting its helpers to pointers would complicate the
+        # copy-and-return semantics of e.g. withConcept for no real gain.
+        - hugeParam
+
+    goheader:
+      # Every Go file must carry the MIT license header; the linter keeps
+      # new files consistent with the existing ones.
+      template: |-
+        SPDX-License-Identifier: MIT
+        Copyright (c) {{ YEAR }} {{ HOLDER }}
+      values:
+        const:
+          HOLDER: Eric Neidhardt
+        regexp:
+          # Any year or year range (e.g. 2026 or 2026-2027), so extending
+          # the notice in later years does not break the check.
+          YEAR: 20\d{2}(-20\d{2})?
+
+# Formatters
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+
+issues:
+  # Maximum count of issues with the same text to include (0 = unlimited).
+  # Keep at 0: capping hides repeated findings while working them off.
+  max-same-issues: 0
