@@ -185,8 +185,7 @@ go test ./...
 The test suite covers the expression grammar, the YAML/CSV parsers, the
 loader (imports, cycles, duplicates), unit conversion, the evaluation engine
 (including uncertain values and derived literals) and the writer round trip.
-Assertions use the small helpers in `internal/verify`; since they are
-fail-fast, table-driven tests run each case as a `t.Run` subtest.
+
 `testdata/weather` contains a condensed version of the standard's weather
 example, and `testdata/sample_odds` holds three small self-contained
 example ODDs: a minimal daytime city ODD, one with EXCLUDE sections and
@@ -195,8 +194,7 @@ derived literals, and one composed from helper modules and a parameter.
 ## Acknowledgement
 
 This library, including its source code, test suite, and documentation, was
-generated with the assistance of artificial intelligence — [GLM 5.3](https://z.ai)
-(Z.ai) — under human direction and review.
+generated with the help of artificial intelligence (GLM 5.3).
 
 ## License
 
