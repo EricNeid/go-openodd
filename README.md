@@ -194,7 +194,7 @@ derived literals, and one composed from helper modules and a parameter.
 ## Acknowledgement
 
 This library, including its source code, test suite, and documentation, was
-generated with the help of artificial intelligence (GLM 5.3).
+generated with the help of artificial intelligence.
 
 ## License
 
