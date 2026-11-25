@@ -22,13 +22,21 @@
 //     and YAML form (see [ParseCODCSV], [ParseCODYAML]).
 //
 //   - An evaluation engine that decides whether a COD/OD record lies inside
-//     or outside an ODD (see [NewEvaluator], [Evaluator.Evaluate]).
+//     or outside an ODD (see [NewEvaluator], [Evaluator.Evaluate]). Records
+//     that carry no value for a concept a condition requires classify as
+//     [VerdictUnknown] instead (see [Evaluator.Classify]).
 //
 // Semantics implemented by the evaluation engine follow the ASAM OpenODD
 // model: a module evaluates to INCLUDE AND (NOT EXCLUDE); INCLUDE_AND,
 // INCLUDE_OR, EXCLUDE_AND and EXCLUDE_OR sections combine their conditions
 // accordingly; conditions reference taxonomy concepts, modules or labels;
 // labels are the disjunction of all modules carrying the label.
+//
+// Conditions over values the record does not carry evaluate to UNKNOWN
+// instead of false; verdicts combine under Kleene logic, so a record is
+// inside only when every condition is provably true, and a violated
+// condition decides outside even when other conditions cannot be judged.
+// The boolean evaluation API collapses UNKNOWN to not-inside.
 //
 // Boundary handling: the standard allows inference engines to assign either
 // side of a range boundary (Section 6.2.4.7 of the standard). This package

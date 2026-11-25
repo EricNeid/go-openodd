@@ -12,7 +12,7 @@ import (
 )
 
 // errMissingFactor reports that a term references a concept for which the
-// record carries no value; the enclosing condition evaluates to false.
+// record carries no value; the enclosing condition evaluates to UNKNOWN.
 var errMissingFactor = errors.New("record has no value for a term factor")
 
 // UncertaintyMode selects how uncertain values are evaluated. Aleatoric
@@ -40,6 +40,11 @@ type EvalOptions struct {
 // Evaluator decides whether COD/OD records lie inside or outside the ODD
 // modules of a model. Create evaluators with [NewEvaluator]; they are safe
 // for concurrent use.
+//
+// Conditions over concepts for which the record carries no value are
+// evaluated with Kleene three-valued logic: [Evaluator.Classify] reports
+// them as [VerdictUnknown] while the boolean evaluation API collapses
+// them to false.
 type Evaluator struct {
 	model *Model
 	idx   *ConceptIndex
@@ -60,31 +65,60 @@ func NewEvaluator(m *Model, opts EvalOptions) (*Evaluator, error) {
 
 // Evaluate evaluates one module for a record. Record keys are
 // canonicalized against the taxonomy first, so both full concept IDs and
-// unambiguous short references work as keys.
+// unambiguous short references work as keys. An UNKNOWN verdict collapses
+// to false; use [Evaluator.ClassifyModule] to keep the three-valued
+// verdict.
 func (e *Evaluator) Evaluate(rec Record, moduleID string) (bool, error) {
-	mod, ok := e.model.Modules[moduleID]
-	if !ok {
-		return false, fmt.Errorf("unknown module %q", moduleID)
-	}
-	ctx := e.newContext(rec)
-	return e.module(ctx, mod)
+	v, err := e.ClassifyModule(rec, moduleID)
+	return v.Bool(), err
 }
 
 // EvaluateRoots evaluates every root module for a record. The result maps
-// root module IDs to their truth values.
+// root module IDs to their truth values, with UNKNOWN collapsed to false;
+// use [Evaluator.ClassifyRoots] to keep the three-valued verdicts.
 func (e *Evaluator) EvaluateRoots(rec Record) (map[string]bool, error) {
+	roots, err := e.ClassifyRoots(rec)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(roots))
+	for id, v := range roots {
+		out[id] = v.Bool()
+	}
+	return out, nil
+}
+
+// ClassifyModule classifies one module for a record. Record keys are
+// canonicalized against the taxonomy first, so both full concept IDs and
+// unambiguous short references work as keys.
+func (e *Evaluator) ClassifyModule(rec Record, moduleID string) (Verdict, error) {
+	mod, ok := e.model.Modules[moduleID]
+	if !ok {
+		return VerdictOutside, fmt.Errorf("unknown module %q", moduleID)
+	}
 	ctx := e.newContext(rec)
-	out := make(map[string]bool, len(e.model.RootIDs))
+	k, err := e.module(ctx, mod)
+	if err != nil {
+		return VerdictOutside, err
+	}
+	return verdictOf(k), nil
+}
+
+// ClassifyRoots classifies every root module for a record. The result maps
+// root module IDs to their three-valued verdicts.
+func (e *Evaluator) ClassifyRoots(rec Record) (map[string]Verdict, error) {
+	ctx := e.newContext(rec)
+	out := make(map[string]Verdict, len(e.model.RootIDs))
 	for _, id := range e.model.RootIDs {
 		mod := e.model.Modules[id]
 		if mod == nil {
 			continue
 		}
-		v, err := e.module(ctx, mod)
+		k, err := e.module(ctx, mod)
 		if err != nil {
 			return nil, err
 		}
-		out[id] = v
+		out[id] = verdictOf(k)
 	}
 	return out, nil
 }
@@ -96,30 +130,57 @@ func (e *Evaluator) newContext(rec Record) *evalCtx {
 		Temporal: rec.Temporal,
 		Spatial:  rec.Spatial,
 	}
-	return &evalCtx{rec: canonical, cache: map[string]bool{}, busy: map[string]bool{}}
+	return &evalCtx{rec: canonical, cache: map[string]kleene{}, busy: map[string]bool{}}
 }
 
 // InsideODD reports whether a record lies inside the ODD: all root modules
-// evaluate to true. Use [Evaluator.EvaluateRoots] for per-root results.
+// evaluate to true. A record with an UNKNOWN verdict is not inside; use
+// [Evaluator.Classify] to keep the three-valued verdict.
 func (e *Evaluator) InsideODD(rec Record) (bool, error) {
-	roots, err := e.EvaluateRoots(rec)
+	v, err := e.Classify(rec)
+	return v.Bool(), err
+}
+
+// Classify classifies a record against the whole ODD: INSIDE when every
+// root module is true, OUTSIDE when any root module is false, UNKNOWN when
+// no root module is false but at least one cannot be judged.
+func (e *Evaluator) Classify(rec Record) (Verdict, error) {
+	roots, err := e.ClassifyRoots(rec)
 	if err != nil {
-		return false, err
+		return VerdictOutside, err
 	}
+	result := kleeneTrue
 	for _, v := range roots {
-		if !v {
-			return false, nil
-		}
+		result = result.and(v.toKleene())
 	}
-	return true, nil
+	return verdictOf(result), nil
 }
 
 // EvaluateCOD evaluates all root modules for every record of a table. The
-// result is aligned with cod.Records.
+// result is aligned with cod.Records, with UNKNOWN collapsed to false; use
+// [Evaluator.ClassifyCOD] to keep the three-valued verdicts.
 func (e *Evaluator) EvaluateCOD(cod *COD) ([]map[string]bool, error) {
-	results := make([]map[string]bool, 0, len(cod.Records))
+	rows, err := e.ClassifyCOD(cod)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]map[string]bool, 0, len(rows))
+	for _, row := range rows {
+		collapsed := make(map[string]bool, len(row))
+		for id, v := range row {
+			collapsed[id] = v.Bool()
+		}
+		results = append(results, collapsed)
+	}
+	return results, nil
+}
+
+// ClassifyCOD classifies all root modules for every record of a table. The
+// result is aligned with cod.Records.
+func (e *Evaluator) ClassifyCOD(cod *COD) ([]map[string]Verdict, error) {
+	results := make([]map[string]Verdict, 0, len(cod.Records))
 	for i := range cod.Records {
-		roots, err := e.EvaluateRoots(cod.Records[i])
+		roots, err := e.ClassifyRoots(cod.Records[i])
 		if err != nil {
 			return nil, fmt.Errorf("record %d: %w", i+1, err)
 		}
@@ -131,110 +192,113 @@ func (e *Evaluator) EvaluateCOD(cod *COD) ([]map[string]bool, error) {
 // evalCtx carries per-record evaluation state.
 type evalCtx struct {
 	rec   Record
-	cache map[string]bool
+	cache map[string]kleene
 	busy  map[string]bool
 }
 
 // module evaluates a module: INCLUDE AND (NOT EXCLUDE), with the missing
 // section rules of Section 6.4.3.4 of the standard.
-func (e *Evaluator) module(ctx *evalCtx, mod *Module) (bool, error) {
+func (e *Evaluator) module(ctx *evalCtx, mod *Module) (kleene, error) {
 	if cached, ok := ctx.cache[mod.ID]; ok {
 		return cached, nil
 	}
 	if !mod.Active {
 		// Inactive modules are ignored; conditions referring to them or
 		// their negation are automatically satisfied.
-		ctx.cache[mod.ID] = true
-		return true, nil
+		ctx.cache[mod.ID] = kleeneTrue
+		return kleeneTrue, nil
 	}
 	if ctx.busy[mod.ID] {
-		return false, fmt.Errorf("cyclic module reference through %q", mod.ID)
+		return kleeneFalse, fmt.Errorf("cyclic module reference through %q", mod.ID)
 	}
 	ctx.busy[mod.ID] = true
 	defer delete(ctx.busy, mod.ID)
 
-	include := true
+	include := kleeneTrue
+	var exclude kleene
 	var err error
 	if mod.Include != nil {
 		include, err = e.section(ctx, mod.Include)
 		if err != nil {
-			return false, fmt.Errorf("module %q INCLUDE: %w", mod.ID, err)
+			return kleeneFalse, fmt.Errorf("module %q INCLUDE: %w", mod.ID, err)
 		}
 	}
-	exclude := false
-	if mod.Exclude != nil {
+	result := include
+	// A false INCLUDE decides the module on its own, mirroring the
+	// short-circuit of the boolean pipeline.
+	if mod.Exclude != nil && result != kleeneFalse {
 		exclude, err = e.section(ctx, mod.Exclude)
 		if err != nil {
-			return false, fmt.Errorf("module %q EXCLUDE: %w", mod.ID, err)
+			return kleeneFalse, fmt.Errorf("module %q EXCLUDE: %w", mod.ID, err)
 		}
+		result = result.and(exclude.not())
 	}
-	result := include && !exclude
 	ctx.cache[mod.ID] = result
 	return result, nil
 }
 
 // section evaluates a section: the AND or OR over its conditions and
 // subsections.
-func (e *Evaluator) section(ctx *evalCtx, sec *Section) (bool, error) {
-	result := sec.Operator == SectionAnd
+func (e *Evaluator) section(ctx *evalCtx, sec *Section) (kleene, error) {
+	result := kleeneOf(sec.Operator == SectionAnd)
 	for _, cond := range sec.Conditions {
 		v, err := e.condition(ctx, cond)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		if sec.Operator == SectionAnd {
-			result = result && v
-		} else {
-			result = result || v
-		}
+		result = combine(sec.Operator, result, v)
 	}
 	for _, sub := range sec.Subsections {
 		v, err := e.section(ctx, sub)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		if sec.Operator == SectionAnd {
-			result = result && v
-		} else {
-			result = result || v
-		}
+		result = combine(sec.Operator, result, v)
 	}
 	return result, nil
 }
 
+// combine folds one operand into a section result.
+func combine(op SectionOperator, result, v kleene) kleene {
+	if op == SectionAnd {
+		return result.and(v)
+	}
+	return result.or(v)
+}
+
 // condition evaluates a single condition by resolving its reference to a
 // module, label or taxonomy concept.
-func (e *Evaluator) condition(ctx *evalCtx, cond *Condition) (bool, error) {
+func (e *Evaluator) condition(ctx *evalCtx, cond *Condition) (kleene, error) {
 	// Modules take precedence over concepts; the standard requires the
 	// ID spaces to be disjoint, so a clash is a validation error.
 	if mod, ok := e.model.Modules[cond.Ref]; ok {
 		want, ok := e.boolOperand(cond)
 		if !ok {
-			return false, fmt.Errorf("condition %q: module references take true or false", cond.Ref)
+			return kleeneFalse, fmt.Errorf("condition %q: module references take true or false", cond.Ref)
 		}
 		if !mod.Active {
-			return true, nil
+			return kleeneTrue, nil
 		}
 		got, err := e.module(ctx, mod)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return got == want, nil
+		return compareOperand(got, want), nil
 	}
 	if _, ok := e.model.Labels[cond.Ref]; ok {
 		want, ok := e.boolOperand(cond)
 		if !ok {
-			return false, fmt.Errorf("condition %q: label references take true or false", cond.Ref)
+			return kleeneFalse, fmt.Errorf("condition %q: label references take true or false", cond.Ref)
 		}
 		got, err := e.label(ctx, cond.Ref)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return got == want, nil
+		return compareOperand(got, want), nil
 	}
 	c, err := e.idx.Resolve(cond.Ref)
 	if err != nil {
-		return false, fmt.Errorf("condition %q: %w", cond.Ref, err)
+		return kleeneFalse, fmt.Errorf("condition %q: %w", cond.Ref, err)
 	}
 	return e.expression(ctx, c, cond.Expr)
 }
@@ -259,8 +323,9 @@ func (e *Evaluator) boolOperand(cond *Condition) (want, isBool bool) {
 // label evaluates a label as the disjunction of its active modules. A
 // label without any active module satisfies every condition referencing
 // it, mirroring the inactive-module rule.
-func (e *Evaluator) label(ctx *evalCtx, label string) (bool, error) {
+func (e *Evaluator) label(ctx *evalCtx, label string) (kleene, error) {
 	anyActive := false
+	result := kleeneFalse
 	for _, id := range e.model.Labels[label] {
 		mod := e.model.Modules[id]
 		if mod == nil || !mod.Active {
@@ -269,21 +334,22 @@ func (e *Evaluator) label(ctx *evalCtx, label string) (bool, error) {
 		anyActive = true
 		v, err := e.module(ctx, mod)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		if v {
-			return true, nil
+		result = result.or(v)
+		if result == kleeneTrue {
+			return kleeneTrue, nil
 		}
 	}
 	if !anyActive {
-		return true, nil
+		return kleeneTrue, nil
 	}
-	return false, nil
+	return result, nil
 }
 
 // expression evaluates a boolean expression over a concept against the
 // record of the current evaluation context.
-func (e *Evaluator) expression(ctx *evalCtx, c *Concept, expr Expression) (bool, error) {
+func (e *Evaluator) expression(ctx *evalCtx, c *Concept, expr Expression) (kleene, error) {
 	switch ex := expr.(type) {
 	case *EqualExpr:
 		return e.equal(ctx, c, ex)
@@ -294,7 +360,7 @@ func (e *Evaluator) expression(ctx *evalCtx, c *Concept, expr Expression) (bool,
 	case *ListExpr:
 		return e.list(ctx, c, ex)
 	default:
-		return false, fmt.Errorf("unsupported expression")
+		return kleeneFalse, fmt.Errorf("unsupported expression")
 	}
 }
 
@@ -307,11 +373,11 @@ func (e *Evaluator) recordValue(ctx *evalCtx, c *Concept) Value {
 }
 
 // equal evaluates Equal expressions.
-func (e *Evaluator) equal(ctx *evalCtx, c *Concept, ex *EqualExpr) (bool, error) {
+func (e *Evaluator) equal(ctx *evalCtx, c *Concept, ex *EqualExpr) (kleene, error) {
 	switch ex.Kind {
 	case ScalarUnknown:
 		v := e.recordValue(ctx, c)
-		return v.Unknown(), nil
+		return kleeneOf(v.Unknown()), nil
 	case ScalarBool:
 		return e.equalBool(ctx, c, ex.Bool)
 	case ScalarNumber:
@@ -321,35 +387,39 @@ func (e *Evaluator) equal(ctx *evalCtx, c *Concept, ex *EqualExpr) (bool, error)
 		// participates in the comparison.
 		if strings.HasPrefix(ex.Str, "$") {
 			if pc, err := e.idx.Resolve(ex.Str); err == nil && pc.Parameter {
-				switch pv := e.recordValue(ctx, pc); {
+				pv := e.recordValue(ctx, pc)
+				switch {
 				case pc.Kind == KindCategorical && pv.Kind == ValueCategorical:
 					return e.equalCategorical(ctx, c, pv.Str)
 				case pc.Kind == KindAttribute && isNumericPrimitive(pc.PrimType) && pv.Kind == ValueNumber:
 					return e.equalNumber(ctx, c, pv.Num, pv.Unit)
+				case pv.Kind == ValueMissing:
+					// The record carries no parameter value.
+					return kleeneUnknown, nil
 				default:
-					// Missing or incompatible parameter value.
-					return false, nil
+					// Incompatible parameter value.
+					return kleeneFalse, nil
 				}
 			}
 		}
 		if ex.Str == "unknown" {
 			v := e.recordValue(ctx, c)
-			return v.Unknown(), nil
+			return kleeneOf(v.Unknown()), nil
 		}
 		return e.equalCategorical(ctx, c, ex.Str)
 	}
 }
 
-func (e *Evaluator) equalBool(ctx *evalCtx, c *Concept, want bool) (bool, error) {
+func (e *Evaluator) equalBool(ctx *evalCtx, c *Concept, want bool) (kleene, error) {
 	v := e.recordValue(ctx, c)
 	wantStr := formatBool(want)
 	switch v.Kind {
 	case ValueBool:
-		return v.Bool == want, nil
+		return kleeneOf(v.Bool == want), nil
 	case ValueCategorical:
-		return v.Str == wantStr, nil
+		return kleeneOf(v.Str == wantStr), nil
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			switch item.Kind {
 			case ValueBool:
 				return item.Bool == want, nil
@@ -358,10 +428,11 @@ func (e *Evaluator) equalBool(ctx *evalCtx, c *Concept, want bool) (bool, error)
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
-		return false, nil
+		return kleeneUnknown, nil
 	default:
-		return false, fmt.Errorf("concept %q: boolean comparison needs a boolean value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: boolean comparison needs a boolean value, got %s", c.ID, v.Kind)
 	}
 }
 
@@ -372,31 +443,31 @@ func formatBool(b bool) string {
 	return "false"
 }
 
-func (e *Evaluator) equalNumber(ctx *evalCtx, c *Concept, want float64, unit string) (bool, error) {
+func (e *Evaluator) equalNumber(ctx *evalCtx, c *Concept, want float64, unit string) (kleene, error) {
 	v := e.recordValue(ctx, c)
 	switch v.Kind {
 	case ValueNumber:
 		w, err := e.convertToConceptBase(c, want, unit)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		x, err := e.valueInConceptBase(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return numEqual(x, w), nil
+		return kleeneOf(numEqual(x, w)), nil
 	case ValueRange:
 		w, err := e.convertToConceptBase(c, want, unit)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		conv, err := e.convertedRange(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return e.compareInterval(OpNone, conv.Min, conv.Max, w), nil
+		return kleeneOf(e.compareInterval(OpNone, conv.Min, conv.Max, w)), nil
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			if item.Kind == ValueNumber {
 				w, err := e.convertToConceptBase(c, want, unit)
 				if err != nil {
@@ -410,35 +481,32 @@ func (e *Evaluator) equalNumber(ctx *evalCtx, c *Concept, want float64, unit str
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
-		return false, nil
+		return kleeneUnknown, nil
 	default:
-		return false, fmt.Errorf("concept %q: numeric equality needs a numeric value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: numeric equality needs a numeric value, got %s", c.ID, v.Kind)
 	}
 }
 
-func (e *Evaluator) equalCategorical(ctx *evalCtx, c *Concept, want string) (bool, error) {
+func (e *Evaluator) equalCategorical(ctx *evalCtx, c *Concept, want string) (kleene, error) {
 	v := e.recordValue(ctx, c)
 	switch v.Kind {
 	case ValueCategorical:
 		if v.Str == want {
-			return true, nil
+			return kleeneTrue, nil
 		}
 		// The record may carry a numeric value for the concept that
 		// defines the literal; derive the literal from the record.
 		return e.derivedLiteralEquals(ctx, c, want)
 	case ValueBool:
-		return formatBool(v.Bool) == want, nil
+		return kleeneOf(formatBool(v.Bool) == want), nil
 	case ValueNumber:
 		// A numeric record value is matched against the defining
 		// constraints of the literal.
-		lit, ok := e.deriveLiteral(ctx, c)
-		if !ok {
-			return false, nil
-		}
-		return lit == want, nil
+		return e.derivedLiteralMatches(ctx, c, want)
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			switch item.Kind {
 			case ValueCategorical:
 				return item.Str == want, nil
@@ -450,34 +518,52 @@ func (e *Evaluator) equalCategorical(ctx *evalCtx, c *Concept, want string) (boo
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
 		// The record may carry values for the concepts defining the
 		// literals; derive the literal from those constraints.
-		lit, ok := e.deriveLiteral(ctx, c)
-		return ok && lit == want, nil
+		return e.derivedLiteralMatches(ctx, c, want)
 	default:
-		return false, fmt.Errorf("concept %q: literal comparison needs a categorical value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: literal comparison needs a categorical value, got %s", c.ID, v.Kind)
 	}
 }
 
 // derivedLiteralEquals checks the defining constraints of a literal
 // against the record.
-func (e *Evaluator) derivedLiteralEquals(ctx *evalCtx, c *Concept, want string) (bool, error) {
+func (e *Evaluator) derivedLiteralEquals(ctx *evalCtx, c *Concept, want string) (kleene, error) {
 	lit := c.Literal(want)
 	if lit == nil || len(lit.Constraints) == 0 {
-		return false, nil
+		return kleeneFalse, nil
 	}
+	result := kleeneTrue
 	for _, cons := range lit.Constraints {
 		cc, err := e.idx.Resolve(cons.Ref)
 		if err != nil {
-			return false, fmt.Errorf("literal %q of %q: %w", want, c.ID, err)
+			return kleeneFalse, fmt.Errorf("literal %q of %q: %w", want, c.ID, err)
 		}
-		ok, err := e.expression(ctx, cc, cons.Expr)
-		if err != nil || !ok {
-			return false, err
+		v, err := e.expression(ctx, cc, cons.Expr)
+		if err != nil {
+			return kleeneFalse, err
+		}
+		if v == kleeneFalse {
+			return kleeneFalse, nil
+		}
+		if v == kleeneUnknown {
+			result = kleeneUnknown
 		}
 	}
-	return true, nil
+	return result, nil
+}
+
+// derivedLiteralMatches derives the record's literal of a concept and
+// compares it against the wanted name; UNKNOWN when no literal can be
+// derived.
+func (e *Evaluator) derivedLiteralMatches(ctx *evalCtx, c *Concept, want string) (kleene, error) {
+	lit, ok := e.deriveLiteral(ctx, c)
+	if !ok {
+		return kleeneUnknown, nil
+	}
+	return kleeneOf(lit == want), nil
 }
 
 // deriveLiteral maps a numeric record value to the literal whose defining
@@ -487,19 +573,25 @@ func (e *Evaluator) deriveLiteral(ctx *evalCtx, c *Concept) (string, bool) {
 		if len(lit.Constraints) == 0 {
 			continue
 		}
-		match := true
+		match := kleeneTrue
 		for _, cons := range lit.Constraints {
 			cc, err := e.idx.Resolve(cons.Ref)
 			if err != nil {
 				return "", false
 			}
-			ok, err := e.expression(ctx, cc, cons.Expr)
-			if err != nil || !ok {
-				match = false
+			v, err := e.expression(ctx, cc, cons.Expr)
+			if err != nil {
+				return "", false
+			}
+			if v == kleeneFalse {
+				match = kleeneFalse
 				break
 			}
+			if v == kleeneUnknown {
+				match = kleeneUnknown
+			}
 		}
-		if match {
+		if match == kleeneTrue {
 			return lit.Name, true
 		}
 	}
@@ -507,65 +599,65 @@ func (e *Evaluator) deriveLiteral(ctx *evalCtx, c *Concept) (string, bool) {
 }
 
 // bound evaluates UpperBound and LowerBound expressions.
-func (e *Evaluator) bound(ctx *evalCtx, c *Concept, ex *BoundExpr) (bool, error) {
+func (e *Evaluator) bound(ctx *evalCtx, c *Concept, ex *BoundExpr) (kleene, error) {
 	if c.Kind == KindCategorical {
 		return e.boundCategorical(ctx, c, ex)
 	}
 	threshold, termType, err := e.term(ctx, ex.Term)
 	if err != nil {
 		if errors.Is(err, errMissingFactor) {
-			return false, nil
+			return kleeneUnknown, nil
 		}
-		return false, err
+		return kleeneFalse, err
 	}
 	if ex.Unit != "" {
 		err = e.checkUnit(c, ex.Unit)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		threshold, err = e.convertUnitToBase(c, threshold, ex.Unit)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 	} else if termType != "" && c.UnitType != "" && termType != c.UnitType {
-		return false, fmt.Errorf("concept %q has unit type %q but the term is of unit type %q", c.ID, c.UnitType, termType)
+		return kleeneFalse, fmt.Errorf("concept %q has unit type %q but the term is of unit type %q", c.ID, c.UnitType, termType)
 	}
 	v := e.recordValue(ctx, c)
 	return e.compareNumber(c, v, ex.Op, threshold)
 }
 
 // rangeExpr evaluates Range expressions "[a .. b]".
-func (e *Evaluator) rangeExpr(ctx *evalCtx, c *Concept, ex *RangeExpr) (bool, error) {
+func (e *Evaluator) rangeExpr(ctx *evalCtx, c *Concept, ex *RangeExpr) (kleene, error) {
 	if c.Kind == KindCategorical {
 		return e.rangeCategorical(ctx, c, ex)
 	}
 	lo, lot, err := e.term(ctx, ex.Min)
 	if err != nil {
 		if errors.Is(err, errMissingFactor) {
-			return false, nil
+			return kleeneUnknown, nil
 		}
-		return false, err
+		return kleeneFalse, err
 	}
 	hi, hit, err := e.term(ctx, ex.Max)
 	if err != nil {
 		if errors.Is(err, errMissingFactor) {
-			return false, nil
+			return kleeneUnknown, nil
 		}
-		return false, err
+		return kleeneFalse, err
 	}
 	if lot != "" && hit != "" && lot != hit {
-		return false, fmt.Errorf("concept %q: range bounds use different unit types %q and %q", c.ID, lot, hit)
+		return kleeneFalse, fmt.Errorf("concept %q: range bounds use different unit types %q and %q", c.ID, lot, hit)
 	}
 	if ex.Unit != "" {
 		err = e.checkUnit(c, ex.Unit)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		if lo, err = e.convertUnitToBase(c, lo, ex.Unit); err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		if hi, err = e.convertUnitToBase(c, hi, ex.Unit); err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 	}
 	v := e.recordValue(ctx, c)
@@ -626,22 +718,22 @@ func (e *Evaluator) compareInterval(op CmpOp, lo, hi, t float64) bool {
 }
 
 // compareNumber compares a record value against a threshold.
-func (e *Evaluator) compareNumber(c *Concept, v Value, op CmpOp, threshold float64) (bool, error) {
+func (e *Evaluator) compareNumber(c *Concept, v Value, op CmpOp, threshold float64) (kleene, error) {
 	switch v.Kind {
 	case ValueNumber:
 		x, err := e.valueInConceptBase(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return compare(x, op, threshold), nil
+		return kleeneOf(compare(x, op, threshold)), nil
 	case ValueRange:
 		conv, err := e.convertedRange(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return e.compareInterval(op, conv.Min, conv.Max, threshold), nil
+		return kleeneOf(e.compareInterval(op, conv.Min, conv.Max, threshold)), nil
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			if item.Kind == ValueNumber {
 				x, err := e.valueInConceptBase(c, item)
 				if err != nil {
@@ -651,35 +743,36 @@ func (e *Evaluator) compareNumber(c *Concept, v Value, op CmpOp, threshold float
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
-		return false, nil
+		return kleeneUnknown, nil
 	default:
-		return false, fmt.Errorf("concept %q: bound comparison needs a numeric value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: bound comparison needs a numeric value, got %s", c.ID, v.Kind)
 	}
 }
 
 // compareRange checks membership in the condition interval [lo, hi]. For an
 // uncertain record interval, possibility asks for a non-empty intersection
 // with the condition interval and certainty for containment.
-func (e *Evaluator) compareRange(c *Concept, v Value, lo, hi float64) (bool, error) {
+func (e *Evaluator) compareRange(c *Concept, v Value, lo, hi float64) (kleene, error) {
 	switch v.Kind {
 	case ValueNumber:
 		x, err := e.valueInConceptBase(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
-		return inInterval(x, lo, hi), nil
+		return kleeneOf(inInterval(x, lo, hi)), nil
 	case ValueRange:
 		conv, err := e.convertedRange(c, v)
 		if err != nil {
-			return false, err
+			return kleeneFalse, err
 		}
 		if e.opts.Uncertainty == Certainty {
-			return conv.Min >= lo && conv.Max <= hi, nil
+			return kleeneOf(conv.Min >= lo && conv.Max <= hi), nil
 		}
-		return conv.Min <= hi && conv.Max >= lo, nil
+		return kleeneOf(conv.Min <= hi && conv.Max >= lo), nil
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			if item.Kind == ValueNumber {
 				x, err := e.valueInConceptBase(c, item)
 				if err != nil {
@@ -689,10 +782,11 @@ func (e *Evaluator) compareRange(c *Concept, v Value, lo, hi float64) (bool, err
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
-		return false, nil
+		return kleeneUnknown, nil
 	default:
-		return false, fmt.Errorf("concept %q: range comparison needs a numeric value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: range comparison needs a numeric value, got %s", c.ID, v.Kind)
 	}
 }
 
@@ -893,41 +987,43 @@ func (e *Evaluator) checkUnit(c *Concept, unit string) error {
 
 // boundCategorical evaluates a bound over orderable categorical literals,
 // for example "rain_level: < heavy_rain".
-func (e *Evaluator) boundCategorical(ctx *evalCtx, c *Concept, ex *BoundExpr) (bool, error) {
+func (e *Evaluator) boundCategorical(ctx *evalCtx, c *Concept, ex *BoundExpr) (kleene, error) {
 	order, err := e.literalOrder(c)
 	if err != nil {
-		return false, err
+		return kleeneFalse, err
 	}
 	threshold, ok := order[ex.Term.String()]
 	if !ok {
-		return false, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Term.String())
+		return kleeneFalse, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Term.String())
 	}
 	idx, ok := e.categoricalIndex(ctx, c)
 	if !ok {
-		return false, nil
+		// The record's literal is missing or not orderable.
+		return kleeneUnknown, nil
 	}
-	return compare(float64(idx), ex.Op, float64(threshold)), nil
+	return kleeneOf(compare(float64(idx), ex.Op, float64(threshold))), nil
 }
 
 // rangeCategorical evaluates a range over orderable categorical literals.
-func (e *Evaluator) rangeCategorical(ctx *evalCtx, c *Concept, ex *RangeExpr) (bool, error) {
+func (e *Evaluator) rangeCategorical(ctx *evalCtx, c *Concept, ex *RangeExpr) (kleene, error) {
 	order, err := e.literalOrder(c)
 	if err != nil {
-		return false, err
+		return kleeneFalse, err
 	}
 	lo, ok := order[ex.Min.String()]
 	if !ok {
-		return false, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Min.String())
+		return kleeneFalse, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Min.String())
 	}
 	hi, ok := order[ex.Max.String()]
 	if !ok {
-		return false, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Max.String())
+		return kleeneFalse, fmt.Errorf("concept %q: %q is not a categorical literal", c.ID, ex.Max.String())
 	}
 	idx, ok := e.categoricalIndex(ctx, c)
 	if !ok {
-		return false, nil
+		// The record's literal is missing or not orderable.
+		return kleeneUnknown, nil
 	}
-	return idx >= lo && idx <= hi, nil
+	return kleeneOf(idx >= lo && idx <= hi), nil
 }
 
 // categoricalIndex determines the order index of the record's literal for
@@ -1010,7 +1106,7 @@ func (e *Evaluator) literalOrder(c *Concept) (map[string]int, error) {
 func (e *Evaluator) constraintInterval(cons Constraint, cc *Concept) (lo, hi float64, ok bool, err error) {
 	switch expr := cons.Expr.(type) {
 	case *BoundExpr:
-		t, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]bool{}, busy: map[string]bool{}}, expr.Term)
+		t, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]kleene{}, busy: map[string]bool{}}, expr.Term)
 		if err != nil {
 			return 0, 0, false, err
 		}
@@ -1029,11 +1125,11 @@ func (e *Evaluator) constraintInterval(cons Constraint, cc *Concept) (lo, hi flo
 			return t, t, true, nil
 		}
 	case *RangeExpr:
-		lo, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]bool{}, busy: map[string]bool{}}, expr.Min)
+		lo, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]kleene{}, busy: map[string]bool{}}, expr.Min)
 		if err != nil {
 			return 0, 0, false, err
 		}
-		hi, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]bool{}, busy: map[string]bool{}}, expr.Max)
+		hi, _, err := e.term(&evalCtx{rec: Record{}, cache: map[string]kleene{}, busy: map[string]bool{}}, expr.Max)
 		if err != nil {
 			return 0, 0, false, err
 		}
@@ -1051,22 +1147,25 @@ func (e *Evaluator) constraintInterval(cons Constraint, cc *Concept) (lo, hi flo
 }
 
 // list evaluates CategoricalList expressions.
-func (e *Evaluator) list(ctx *evalCtx, c *Concept, ex *ListExpr) (bool, error) {
+func (e *Evaluator) list(ctx *evalCtx, c *Concept, ex *ListExpr) (kleene, error) {
 	items, err := e.expandListItems(ctx, ex.Items)
 	if err != nil {
-		return false, err
+		return kleeneFalse, err
 	}
 	v := e.recordValue(ctx, c)
 	switch v.Kind {
 	case ValueCategorical:
-		return contains(items, v.Str), nil
+		return kleeneOf(contains(items, v.Str)), nil
 	case ValueBool:
-		return contains(items, formatBool(v.Bool)), nil
+		return kleeneOf(contains(items, formatBool(v.Bool))), nil
 	case ValueNumber:
 		lit, ok := e.deriveLiteral(ctx, c)
-		return ok && contains(items, lit), nil
+		if !ok {
+			return kleeneUnknown, nil
+		}
+		return kleeneOf(contains(items, lit)), nil
 	case ValueList:
-		return e.anyOf(v, func(item Value) (bool, error) {
+		ok, err := e.anyOf(v, func(item Value) (bool, error) {
 			switch item.Kind {
 			case ValueCategorical:
 				return contains(items, item.Str), nil
@@ -1078,14 +1177,21 @@ func (e *Evaluator) list(ctx *evalCtx, c *Concept, ex *ListExpr) (bool, error) {
 			}
 			return false, nil
 		})
+		return kleeneOf(ok), err
 	case ValueMissing:
+		// The record may carry values for the concepts defining the
+		// literals; derive the literal from those constraints.
 		lit, ok := e.deriveLiteral(ctx, c)
 		if ok && contains(items, lit) {
-			return true, nil
+			return kleeneTrue, nil
 		}
-		return contains(items, "unknown"), nil
+		// A list accepts missing values through an "unknown" item.
+		if contains(items, "unknown") {
+			return kleeneTrue, nil
+		}
+		return kleeneUnknown, nil
 	default:
-		return false, fmt.Errorf("concept %q: list comparison needs a categorical value, got %s", c.ID, v.Kind)
+		return kleeneFalse, fmt.Errorf("concept %q: list comparison needs a categorical value, got %s", c.ID, v.Kind)
 	}
 }
 

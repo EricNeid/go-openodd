@@ -21,7 +21,8 @@ formats. This package is a **library** (no CLI) providing:
   COD/OD records, including `IMPORT` following; COD/OD tables in CSV form;
   optional manifest files.
 - **Evaluation engine** — decides whether a COD/OD record lies inside or
-  outside an ODD, including unit conversion and uncertain values.
+  outside an ODD — or **unknown**, when the record lacks a property the ODD
+  requires — including unit conversion and uncertain values.
 - **Validator** — checks reference resolution, expression/concept type
   compatibility, unit compatibility, label disjointness and module cycles.
 
@@ -88,6 +89,36 @@ rec := openodd.Record{Values: map[string]openodd.Value{
     "wind_speed": openodd.Value{Kind: openodd.ValueNumber, Num: 72, Unit: "km/h"},
 }}
 ```
+
+### Classifying records: inside, outside or unknown
+
+`Evaluate` and friends are boolean: a record is inside only when every
+condition holds. Records that lack a value for a concept an ODD requires
+are not silently outside — classify them to keep the three-valued verdict:
+
+```go
+verdict, err := ev.Classify(rec)                    // the whole ODD
+verdicts, err := ev.ClassifyRoots(rec)              // map[string]openodd.Verdict
+verdict, err := ev.ClassifyModule(rec, "example_module_1")
+```
+
+The verdict is one of `openodd.VerdictInside`, `openodd.VerdictOutside` or
+`openodd.VerdictUnknown`. Verdicts combine under Kleene logic: a record is
+inside only when every condition is provably true, outside when any
+condition is violated (even if other conditions cannot be judged), and
+unknown when nothing is violated but a condition references a concept the
+record carries no value for. The boolean API collapses unknown to
+not-inside.
+
+COD/OD tables classify row by row:
+
+```go
+rows, err := ev.ClassifyCOD(cod) // one map[string]openodd.Verdict per row
+```
+
+See `sample_odds_test.go` for complete examples of comparing an ODD with
+OD records and OD tables, including rows that classify as unknown when
+the ODD requires a property the table does not carry.
 
 ### COD/OD tables
 
@@ -158,6 +189,11 @@ room for interpretation, this package uses the following rules:
   constraints, enabling `rain_level: < heavy_rain`. A numeric record value
   for the underlying measure derives the literal
   (`rainfall_rate: 5 mm/h` ⇒ `moderate_rain`).
+- **Missing values** — conditions over concepts the record does not carry
+  evaluate to UNKNOWN instead of false; verdicts combine under Kleene
+  logic (false dominates, unknown survives), so a violated condition
+  decides outside even when other conditions cannot be judged. The
+  boolean evaluation API collapses UNKNOWN to not-inside.
 - **unknown** — the missing-value keywords (`unknown`, `none`, `null`)
   evaluate `x: unknown` to true exactly when the record has no value.
   Module IDs, literals and labels must never be named `unknown`.
@@ -187,9 +223,12 @@ loader (imports, cycles, duplicates), unit conversion, the evaluation engine
 (including uncertain values and derived literals) and the writer round trip.
 
 `testdata/weather` contains a condensed version of the standard's weather
-example, and `testdata/sample_odds` holds three small self-contained
+example, and `testdata/sample_odds` holds four small self-contained
 example ODDs: a minimal daytime city ODD, one with EXCLUDE sections and
-derived literals, and one composed from helper modules and a parameter.
+derived literals, one composed from helper modules and a parameter, and a
+delivery ODD for OD rows that may lack values. `sample_odds_test.go` shows
+how to compare these ODDs with OD records and OD tables in CSV form,
+including the three-valued unknown verdicts.
 
 ## Acknowledgement
 
